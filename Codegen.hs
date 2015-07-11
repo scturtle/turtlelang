@@ -108,7 +108,9 @@ data CodegenState
   , count        :: Word                     -- Count of unnamed instructions
   , names        :: Names                    -- Name Supply
   , extraFuncs   :: [LLVM ()]                -- LLVM computations of lambdas
-  , funcName     :: String                   -- 'CodegenState's function name
+  , letVars      :: [SymName]                -- Unfinished variables in upper 'let'
+  , funcName     :: String                   -- CodegenState's function name
+  , lambdaCnt    :: Int
   } {- deriving Show -}
 
 data BlockState
@@ -146,14 +148,14 @@ emptyBlock i = BlockState i [] Nothing
 -- emptyCodegen :: CodegenState
 -- emptyCodegen = CodegenState (Name entryBlockName) Map.empty [] 1 0 Map.empty []
 
-emptyCodegen :: SymName -> CodegenState
-emptyCodegen = CodegenState (Name entryBlockName) Map.empty [] 1 0 Map.empty []
+emptyCodegen :: SymName -> Int -> CodegenState
+emptyCodegen = CodegenState (Name entryBlockName) Map.empty [] 1 0 Map.empty [] []
 
 -- execCodegen :: [(String, Operand)] -> Codegen a -> CodegenState
 -- execCodegen vars m = execState (runCodegen m) emptyCodegen { symtab = vars }
 
-execCodegen :: SymName -> Codegen a -> CodegenState
-execCodegen fname computation = execState (runCodegen computation) $ emptyCodegen fname
+execCodegen :: SymName -> Int -> Codegen a -> CodegenState
+execCodegen fname lbdCnt computation = execState (runCodegen computation) $ emptyCodegen fname lbdCnt
 
 fresh :: Codegen Word
 fresh = do
