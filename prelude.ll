@@ -1,6 +1,7 @@
-declare i32 @printf(i8*, ...)
 @.str = private unnamed_addr constant [4 x i8] c"%d\0A\00"
+declare i32 @printf(i8*, ...)
 declare i8* @malloc(i32)
+declare i64 @entryFunc()
 
 define i32 @main() {
   %1 = call i64 @entryFunc()

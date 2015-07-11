@@ -34,10 +34,7 @@ uintSizeBytes :: Integral a => a
 uintSizeBytes  = uintSize `div` 8
 
 entryFuncName :: SymName
-entryFuncName = "entryFun"
-
-initGlobalsFuncName :: SymName
-initGlobalsFuncName = "initGlobals"
+entryFuncName = "entryFunc"
 
 constUint :: Integral i => i -> Operand
 constUint = ConstantOperand . C.Int uintSize . fromIntegral
@@ -63,24 +60,28 @@ codegenFunction funcname argTys prologue args expr = do
       store var (local (AST.Name a))
       assign a var
     prologue
-    ret <$> codegenExpr expr
+    val <- codegenExpr expr
+    ret val
 
 codegenTop :: Expr -> LLVM()
-codegenTop {- expr -} = codegenFunction entryFuncName [] bodyPrelude [] {- expr -}
-   where bodyPrelude = call (funcOpr uint (AST.Name initGlobalsFuncName) []) []
+codegenTop {- expr -} = codegenFunction entryFuncName [] (return ()) [] {- expr -}
 
-liftError :: ExceptT String IO a -> IO a
-liftError = runExceptT >=> either fail return
+liftError :: Show b => ExceptT b IO a -> IO a
+liftError = runExceptT >=> either (fail . show) return
 
 codegen :: Expr -> IO String
-codegen fn = withContext $ \ctx ->
-    liftError $ withModuleFromAST ctx ast $ \m -> moduleLLVMAssembly m
-  where ast = runLLVM (emptyModule "init") $ codegenTop fn
+codegen expr = withContext $ \ctx ->
+    liftError $ withModuleFromLLVMAssembly ctx (File "prelude.ll") $ \prelude ->
+      liftError $ withModuleFromAST ctx ast $ \m -> do
+        liftError $ linkModules False m prelude
+        moduleLLVMAssembly m
+  where ast = runLLVM (emptyModule "init") $ codegenTop expr
 
 -------------------------------------------------------------------------------
 
 codegenExpr :: Expr -> Codegen AST.Operand
 codegenExpr (Num n) = return . constUint $ n
+-- TODO
 
 -------------------------------------------------------------------------------
 
