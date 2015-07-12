@@ -1,12 +1,7 @@
 --------------------------------------------------------------------
--- |
--- Module    :  Codegen
--- Copyright :  (c) Stephen Diehl 2013
--- License   :  MIT
--- Maintainer:  stephen.m.diehl@gmail.com
--- Stability :  experimental
--- Portability: non-portable
---
+-- modified from:
+-- http://www.stephendiehl.com/llvm/
+-- https://github.com/talw/crisp-compiler/
 --------------------------------------------------------------------
 
 {-# LANGUAGE OverloadedStrings #-}
@@ -14,23 +9,21 @@
 
 module Codegen where
 
--- import Data.Word
--- import Data.String
+import Data.Word
 import Data.List
+import Data.Maybe
 import Data.Function
 import qualified Data.Map as Map
 
 import Control.Monad.State
--- import Control.Applicative
 
 import LLVM.General.AST
 import LLVM.General.AST.Global
 import qualified LLVM.General.AST as AST
 
 import qualified LLVM.General.AST.Constant as C
-import qualified LLVM.General.AST.Attribute as A
 import qualified LLVM.General.AST.CallingConvention as CC
-import qualified LLVM.General.AST.FloatingPointPredicate as FP
+import qualified LLVM.General.AST.IntegerPredicate as IP
 
 import Syntax (SymName)
 
@@ -74,9 +67,38 @@ external retty label argtys = addDefn $
 -- Types
 -------------------------------------------------------------------------------
 
--- IEEE 754 double
-double :: Type
-double = FloatingPointType 64 IEEE
+uintSize :: Num a => a
+uintSize = 64
+
+i8, i32, uint :: Type
+i8 = IntegerType 8
+i32 = IntegerType 32
+uint = IntegerType uintSize
+
+uintSizeBytes :: Integral a => a
+uintSizeBytes  = uintSize `div` 8
+
+constUintSize :: Integral i => Word32 -> i -> Operand
+constUintSize size = cons . C.Int size . fromIntegral
+
+constUint, i32c :: Int -> Operand
+constUint = constUintSize uintSize
+i32c = constUintSize 32
+
+envVarName :: String
+envVarName = "__env"
+
+structType :: [AST.Type] -> AST.Type
+structType = AST.StructureType True
+
+lambdaSig :: [AST.Type]
+lambdaSig = [uint, uint]
+
+funcType :: AST.Type
+funcType = AST.FunctionType uint lambdaSig False
+
+closType :: AST.Type
+closType = structType [uint, uint]
 
 -------------------------------------------------------------------------------
 -- Names
@@ -89,9 +111,6 @@ uniqueName nm ns =
   case Map.lookup nm ns of
     Nothing -> (nm,  Map.insert nm 1 ns)
     Just ix -> (nm ++ show ix, Map.insert nm (ix+1) ns)
-
--- instance IsString Name where
---   fromString = Name . fromString
 
 -------------------------------------------------------------------------------
 -- Codegen State
@@ -107,10 +126,10 @@ data CodegenState
   , blockCount   :: Int                      -- Count of basic blocks
   , count        :: Word                     -- Count of unnamed instructions
   , names        :: Names                    -- Name Supply
-  , extraFuncs   :: [LLVM ()]                -- LLVM computations of lambdas
-  , letVars      :: [SymName]                -- Unfinished variables in upper 'let'
+  , extraFuncs   :: [LLVM ()]                -- Lambdas
+  , envBindings  :: [(Operand, Operand)]     -- [(fvPtr, valPtr)]
   , funcName     :: String                   -- CodegenState's function name
-  , lambdaCnt    :: Int
+  , lambdaCnt    :: Int                      -- Sync
   } {- deriving Show -}
 
 data BlockState
@@ -127,17 +146,14 @@ data BlockState
 newtype Codegen a = Codegen { runCodegen :: State CodegenState a }
   deriving (Functor, Applicative, Monad, MonadState CodegenState )
 
-sortBlocks :: [(Name, BlockState)] -> [(Name, BlockState)]
-sortBlocks = sortBy (compare `on` (idx . snd))
-
 createBlocks :: CodegenState -> [BasicBlock]
 createBlocks m = map makeBlock $ sortBlocks $ Map.toList (blocks m)
+  where sortBlocks = sortBy (compare `on` (idx . snd))
 
 makeBlock :: (Name, BlockState) -> BasicBlock
 makeBlock (l, BlockState _ s t) = BasicBlock l s (maketerm t)
-  where
-    maketerm (Just x) = x
-    maketerm Nothing = error $ "Block has no terminator: " ++ show l
+  where maketerm (Just x) = x
+        maketerm Nothing = error $ "Block has no terminator: " ++ show l
 
 entryBlockName :: String
 entryBlockName = "entry"
@@ -145,14 +161,8 @@ entryBlockName = "entry"
 emptyBlock :: Int -> BlockState
 emptyBlock i = BlockState i [] Nothing
 
--- emptyCodegen :: CodegenState
--- emptyCodegen = CodegenState (Name entryBlockName) Map.empty [] 1 0 Map.empty []
-
 emptyCodegen :: SymName -> Int -> CodegenState
 emptyCodegen = CodegenState (Name entryBlockName) Map.empty [] 1 0 Map.empty [] []
-
--- execCodegen :: [(String, Operand)] -> Codegen a -> CodegenState
--- execCodegen vars m = execState (runCodegen m) emptyCodegen { symtab = vars }
 
 execCodegen :: SymName -> Int -> Codegen a -> CodegenState
 execCodegen fname lbdCnt computation = execState (runCodegen computation) $ emptyCodegen fname lbdCnt
@@ -247,42 +257,34 @@ getvar var = do
 
 -- References
 local ::  Name -> Operand
-local = LocalReference double
+local = LocalReference uint
 
 global ::  Name -> C.Constant
-global = C.GlobalReference double
+global = C.GlobalReference uint
 
 externf :: Name -> Operand
-externf = ConstantOperand . C.GlobalReference double
+externf = cons . C.GlobalReference uint
+
+funcOpr :: Type -> Name -> [Type] -> Operand
+funcOpr retTy funcname tys = cons $
+  C.GlobalReference (FunctionType retTy tys False) funcname
 
 -- Arithmetic and Constants
-fadd :: Operand -> Operand -> Codegen Operand
-fadd a b = instr $ FAdd NoFastMathFlags a b []
 
-fsub :: Operand -> Operand -> Codegen Operand
-fsub a b = instr $ FSub NoFastMathFlags a b []
+genBinOp :: String -> Operand -> Operand -> Codegen Operand
+genBinOp opname a b =
+  let opd = fromJust $ lookup opname [("+", Add), ("-", Sub), ("*", Mul)]
+  in  instr $ opd False False a b []
 
-fmul :: Operand -> Operand -> Codegen Operand
-fmul a b = instr $ FMul NoFastMathFlags a b []
-
-fdiv :: Operand -> Operand -> Codegen Operand
-fdiv a b = instr $ FDiv NoFastMathFlags a b []
-
-fcmp :: FP.FloatingPointPredicate -> Operand -> Operand -> Codegen Operand
-fcmp cond a b = instr $ FCmp cond a b []
+icmp :: IP.IntegerPredicate -> Operand -> Operand -> Codegen Operand
+icmp cond a b = instr $ ICmp cond a b []
 
 cons :: C.Constant -> Operand
 cons = ConstantOperand
 
-uitofp :: Type -> Operand -> Codegen Operand
-uitofp ty a = instr $ UIToFP a ty []
-
-toArgs :: [Operand] -> [(Operand, [A.ParameterAttribute])]
-toArgs = map (\x -> (x, []))
-
 -- Effects
 call :: Operand -> [Operand] -> Codegen Operand
-call fn args = instr $ Call False CC.C [] (Right fn) (toArgs args) [] []
+call fn args = instr $ Call False CC.C [] (Right fn) [(x, []) | x <- args] [] []
 
 alloca :: Type -> Codegen Operand
 alloca ty = instr $ Alloca ty Nothing 0 []
@@ -292,6 +294,18 @@ store ptr val = instr $ Store False ptr val Nothing 0 []
 
 load :: Operand -> Codegen Operand
 load ptr = instr $ Load False ptr Nothing 0 []
+
+inttoptr :: Operand -> Type -> Codegen Operand
+inttoptr a b = instr $ IntToPtr a b []
+
+ptrtoint :: Operand -> Type -> Codegen Operand
+ptrtoint a b = instr $ PtrToInt a b []
+
+bitcast :: Operand -> Type -> Codegen Operand
+bitcast a b = instr $ BitCast a b []
+
+getelementptr :: Operand -> Int -> Codegen Operand
+getelementptr addr ix = instr $ GetElementPtr True addr [i32c 0, i32c ix] []
 
 -- Control Flow
 br :: Name -> Codegen (Named Terminator)
